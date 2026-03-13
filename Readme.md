@@ -489,4 +489,4 @@ for (size_t i = 0; i < history.size(); ++i) {
 
 ## License
 
-MIT License © 2026 Tom Muga, don't change a single thing
+MIT License © 2026 Tom Muga
