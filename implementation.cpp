@@ -3,12 +3,8 @@
 #include <array> //fixed size arrays, whose size is static and memory is coontiguous, its knoown at compile time and not run time, faster than vector
 #include <algorithm>//nth_element, move
 #include <queue> //deque used for bfs
-#include "multivariate.h" //multivariate function
-#include "fobj.h" //objective function
-
-
-
-
+#include "include/multivariate.h" //multivariate function
+#include "include/fobj.h" //objective function
 
 template<size_t dim, size_t batch> //makes the class generic ver dim which is dimensions of input variables and batch which is number of samples drawn per iteration
 class Optimizer{ //optimization class
@@ -32,7 +28,7 @@ class Optimizer{ //optimization class
         double refocus_change_rate; //refocus change rate, after ever successfufl refocus, we change the refocus so that the next refocus if an can increasingly focus on better regions
         std::mt19937 rng;
 
-        std::array<double,dim> mu0_generation(){
+        inline std::array<double,dim> mu0_generation(){
             //returns a vector of zeros, this is specifically the initial mean of sampling distributions
 
             std::array<double,dim> mu0{};  //initialize with 0
@@ -42,7 +38,7 @@ class Optimizer{ //optimization class
             return mu0;
         }
 
-        std::array<double, dim*dim> sigma_generation(){
+        inline std::array<double, dim*dim> sigma_generation(){
             //returns a diagonal covariance matrix with matrix 2.0, flattened to a 1d array
             std::array<double, dim*dim> sigma0{};
             for (int r = 0; r < dim; ++r)
@@ -51,289 +47,332 @@ class Optimizer{ //optimization class
             return sigma0;
         }
 
+        std::vector<uint8_t> cluster_mask_macro(const std::array<double, batch * dim>& X_flat, double tau) {
 
+            auto sqdist = [&](size_t i, size_t j) -> double {
+                double d2 = 0.0;
+                const size_t base_i = i * dim;
+                const size_t base_j = j * dim;
 
-
-        std::vector<bool> cluster_mask_macro(const std::array<double, batch*dim> &X_flat, double tau) {
-            //creates macro clusters from X-flat, the tau is the threshold for similarity
-            const size_t N = static_cast<size_t>(batch);
-            if (N == 0) return {};
-
-            // computes squarewise distances - we went with vector as compared to array due to triggered segmentation faults due to a stack overflow
-            //computes euclidean squared distances between all pairs of samples
-
-            std::vector<double> sq;
-            sq.assign(N * N, 0.0);
-            
-            for (size_t i = 0; i < N; ++i) {
-                for (size_t j = i + 1; j < N; ++j) {
-                    double d2 = 0.0;
-                    const size_t base_i = i * dim;
-                    const size_t base_j = j * dim;
-                    for (size_t k = 0; k < dim; ++k) {
-                        double diff = X_flat[base_i + k] - X_flat[base_j + k];
-                        d2 += diff * diff;
-                    }
-                    sq[i * N + j] = d2;
-                    sq[j * N + i] = d2;
+                for (size_t k = 0; k < dim; ++k) {
+                    const double diff = X_flat[base_i + k] - X_flat[base_j + k];
+                    d2 += diff * diff;
                 }
-                sq[i * N + i] = 0.0;
+                return d2;
+            };
+
+            //computes median of pairwise distances
+            auto median_of = [](std::vector<double>& v) -> double {
+                const size_t m = v.size() / 2;
+                auto mid = v.begin() + static_cast<std::ptrdiff_t>(m);
+                std::nth_element(v.begin(), mid, v.end());
+                return *mid;
+            };
+
+            // Estimate median squared distance
+            // Exact for small N, sampled for large N.
+            constexpr size_t sample_budget = 2048; //upper bund on how many distances will be computed
+            const size_t total_pairs = (batch * (batch - 1)) / 2;
+
+            std::vector<double> dist_samples;
+            dist_samples.reserve(std::min(total_pairs, sample_budget)); //avoids repeated allocations during pushback - preallocate enough memory to hld whichever is  2048 or less than
+
+
+                // Approximate median via random sampling of pairs.
+                std::mt19937 rng(123456789u); // deterministic seed for reproducibility of results
+                std::uniform_int_distribution<size_t> pick(0, batch - 1); //picks a random integer from here
+
+                //keeps sampled distance values less than sample budget
+                while (dist_samples.size() < sample_budget) {
+                    //pick two independent random samples from the dataset
+                    size_t i = pick(rng);
+                    size_t j = pick(rng);
+                    if (i == j) continue; //rejects all self pairs
+                    if (i > j) std::swap(i, j); //enforce ordering to avoid redundancy - (i,j) would be same as (j,i) but would be treated as different samples
+                    dist_samples.push_back(sqdist(i, j)); // appends to vector the squared distance
+                }
+            
+            //computes median of sampled distances
+            double median_sq = median_of(dist_samples);
+            if (median_sq < 0.0) median_sq = 0.0;
+
+            const double h = std::sqrt(median_sq) + 1e-12; //converts it back to a distance scale  and prevents h rom being exactly 0
+            const double denom = 2.0 * h * h; // controls how fast similarity decays with distance, larger - slower decay, smaller - sharper decay
+
+            // Estimate median similarity
+            // we convert each distance into a similarity score -  small - similarity close to 1, big - similarity close to 0.
+            std::vector<double> sim_samples;
+            sim_samples.reserve(dist_samples.size());
+            for (double d2 : dist_samples) {
+                sim_samples.push_back(std::exp(-d2 / denom));
             }
 
-            // computes median distance -> kernel width h
-            std::vector<double> sq_copy = sq; // copy to sq_copy to compute median
-            auto mid_it = sq_copy.begin() + (sq_copy.size() / 2);
-            std::nth_element(sq_copy.begin(), mid_it, sq_copy.end()); //auto ensures that it is dropped after use
-            double median_sq = *mid_it;
-            double h = std::sqrt(median_sq) + 1e-12; //1e-12 ensures prevention of division by zero
+            //take the median os similarit values - this gives a typical similarity level
+            const double median_S = median_of(sim_samples);
+            const double thresh = tau * median_S; //multiply by our threshold, larger tau-more strict, smaller - more permissive
 
-            // compute similarity matrix
-            //it converts distance to similarity matrix using a gaussian kernel
-            //close points = 1, distant closer to 0
-            std::vector<double> S;
-            S.resize(N * N);
+            // Build adjacency matrix in a single flat vector
+            std::vector<int> adj(batch * batch, 0);
+
+            for (size_t i = 0; i < batch; ++i) {
+                for (size_t j = i + 1; j < batch; ++j) {
+                    const double d2 = sqdist(i, j);
+                    const double s = std::exp(-d2 / denom);
+
+                    if (s >= thresh) {
+                        adj[i * batch + j] = 1; // there is an edge here
+                        adj[j * batch + i] = 1; // there is an edge here
+                    }
+                }
+            }
+
+            //Find the largest connected component
+            std::vector<uint8_t> visited(batch, 0); // stores the ones visited
+            std::vector<int> best_comp; // stores the largest component found so far
+            std::vector<int> comp; //temporary storage for the current component we are exploring
+            comp.reserve(batch); //preallocate memory
+
+            std::deque<int> q; //BFS queue
+
+            for (size_t i = 0; i < batch; ++i) { // start a traversal from every node
+                if (visited[i]) continue; // skip if already visited
+
+                comp.clear(); //reset current component
+                q.clear(); //reset bfs queue
+
+                visited[i] = 1; //mark starting node as visited
+                q.push_back(static_cast<int>(i)); // start BFS from node i
+
+                while (!q.empty()) { // as long as there are unprocessed nodes, continue processing
+                    const int u = q.front(); // take the next node to process - reads it
+                    q.pop_front(); // mark as processed b removing it from queue
+
+                    comp.push_back(u); // add this node to the current cnnected component 
+
+                    for (size_t v = 0; v < batch; ++v) { // chek all possible nodes to see if the are neighbours of u - scans a flat matrix
+                        const size_t uv = static_cast<size_t>(u) * batch + v; // converts (u,v) into a flat index
+                        if (adj[uv] && !visited[v]) { // is there an edge between u and v and have we not explored v already
+                            visited[v] = 1; // marked as discovered
+                            q.push_back(static_cast<int>(v)); //schedule v to be processed later
+                        }
+                    }
+                }
+                //compare current cmponent vs best seen so far, if bigger, it overwrites it
+                if (comp.size() > best_comp.size()) {
+                    best_comp = comp;
+                }
+}
+            
+
+            // Return a normal byte-based mask
+            std::vector<uint8_t> mask(batch, 0);
+            for (int idx : best_comp) {
+                mask[static_cast<size_t>(idx)] = 1;
+            }
+
+            return mask;
+        }
+
+        std::vector<uint8_t> cluster_mask_micro(const std::vector<double>& Xm, double tau)
+        {
+            // Xm contains flattened macro-cluster samples: N rows, each row has `dim` values.
+            auto sqdist = [&](size_t i, size_t j) -> double {
+                double d2 = 0.0;
+                const size_t base_i = i * dim;
+                const size_t base_j = j * dim;
+
+                for (size_t k = 0; k < dim; ++k) {
+                    const double diff = Xm[base_i + k] - Xm[base_j + k];
+                    d2 += diff * diff;
+                }
+                return d2;
+            };
+
+            auto median_of = [](std::vector<double>& v) -> double {
+                const size_t m = v.size() / 2;
+                auto mid = v.begin() + static_cast<std::ptrdiff_t>(m);
+                std::nth_element(v.begin(), mid, v.end());
+                return *mid;
+            };
+
+            // Estimate median squared distance
+            constexpr size_t sample_budget = 1024;
+            const size_t total_pairs = (batch * (batch - 1)) / 2;
+
+            std::vector<double> dist_samples;
+            dist_samples.reserve(std::min(total_pairs, sample_budget));
+
+
+                // Approximate for larger N: sample random pairs.
+                std::mt19937 rng(123456789u);
+                std::uniform_int_distribution<size_t> pick(0, batch - 1);
+
+                while (dist_samples.size() < sample_budget) {
+                    size_t i = pick(rng);
+                    size_t j = pick(rng);
+                    if (i == j) continue;
+                    if (i > j) std::swap(i, j);
+                    dist_samples.push_back(sqdist(i, j));
+                }
+            
+
+            double median_sq = median_of(dist_samples);
+            if (median_sq < 0.0) median_sq = 0.0;
+
+            const double h = std::sqrt(median_sq) + 1e-12;
             const double denom = 2.0 * h * h;
 
-            for (size_t i = 0; i < N; ++i) {
-                for (size_t j = 0; j < N; ++j) {
-                    
-                    S[i * N + j] = std::exp(-sq[i * N + j] / denom);
-                }
+            // Estimate median similarity
+            std::vector<double> sim_samples;
+            sim_samples.reserve(dist_samples.size());
+
+            for (double d2 : dist_samples) {
+                sim_samples.push_back(std::exp(-d2 / denom));
             }
 
-            // find the median
-            std::vector<double> S_copy = S;
-            auto mid2 = S_copy.begin() + (S_copy.size() / 2);
-            std::nth_element(S_copy.begin(), mid2, S_copy.end());
-            double median_S = *mid2;
-            double thresh = tau * median_S;
+            const double median_S = median_of(sim_samples);
+            const double thresh = tau * median_S;
 
-            // adjacency of neighbours -> it calculates the neighbours of each point
-            std::vector<std::vector<int>> adj(N);
-            for (size_t i = 0; i < N; ++i) {
-                for (size_t j = i + 1; j < N; ++j) {
-                    if (S[i * N + j] >= thresh) {
-                        adj[i].push_back(static_cast<int>(j));
-                        adj[j].push_back(static_cast<int>(i));
+            // Build adjacency matrix in a single flat vector
+            std::vector<int> adj(batch * batch, 0);
+
+            for (size_t i = 0; i < batch; ++i) {
+                for (size_t j = i + 1; j < batch; ++j) {
+                    const double d2 = sqdist(i, j);
+                    const double s = std::exp(-d2 / denom);
+
+                    if (s >= thresh) {
+                        adj[i * batch + j] = 1; // there is an edge here
+                        adj[j * batch + i] = 1; // there is an edge here
                     }
                 }
             }
 
-            //this one works to find the largest connected component in the list of neighbours
-            std::vector<char> visited(N, 0);
+            // Find largest connected component
+            std::vector<uint8_t> visited(batch, 0);
             std::vector<int> best_comp;
             std::vector<int> comp;
-            comp.reserve(N);
+            comp.reserve(batch);
 
             std::deque<int> q;
-            for (size_t i = 0; i < N; ++i) {
+
+            for (size_t i = 0; i < batch; ++i) {
                 if (visited[i]) continue;
-                // BFS from i
+
                 comp.clear();
                 q.clear();
+
                 visited[i] = 1;
                 q.push_back(static_cast<int>(i));
+
                 while (!q.empty()) {
-                    int u = q.front(); q.pop_front();
+                    const int u = q.front();
+                    q.pop_front();
+
                     comp.push_back(u);
-                    for (int v : adj[u]) {
-                        if (!visited[static_cast<size_t>(v)]) {
-                            visited[static_cast<size_t>(v)] = 1;
-                            q.push_back(v);
+
+                    for (size_t v = 0; v < batch; ++v) {
+                        const size_t uv = static_cast<size_t>(u) * batch + v;
+                        if (adj[uv] && !visited[v]) {
+                            visited[v] = 1;
+                            q.push_back(static_cast<int>(v));
                         }
                     }
                 }
-                if (comp.size() > best_comp.size()) best_comp = comp;
-            }
 
-            // build boolean mask of size N
-            std::vector<bool> mask(N, false);
-            for (int idx : best_comp) mask[static_cast<size_t>(idx)] = true;
-
-            return mask;
-        }
-
-        std::vector<bool> cluster_mask_micro(const std::vector<double> &Xm, double tau)
-        {
-            //this one does not take X_flat, it takes Xm, which are the macro clusters collected by macro mask and attempts to find the most connected micro clusters
-            int N = Xm.size() / dim;
-
-            // Pairwise squared distance matrix
-            std::vector<double> sq(N * N, 0.0);
+                if (comp.size() > best_comp.size()) {
+                    best_comp = comp;
+                }
+}
             
-            for (int i = 0; i < N; i++)
-            {
-                for (int j = i; j < N; j++)
-                {
-                    double d2 = 0.0;
-                    for (int k = 0; k < dim; k++)
-                    {
-                        double diff = Xm[i*dim + k] - Xm[j*dim + k];
-                        d2 += diff * diff;
-                    }
 
-                    sq[i*N + j] = d2;
-                    sq[j*N + i] = d2;
-                }
+            // Build byte mask
+            std::vector<uint8_t> mask(batch, 0);
+            for (int idx : best_comp) {
+                mask[static_cast<size_t>(idx)] = 1;
             }
-
-            // median distance
-            std::vector<double> sq_copy = sq;
-            std::nth_element(sq_copy.begin(),
-                            sq_copy.begin() + sq_copy.size()/2,
-                            sq_copy.end());
-
-            double median_sq = sq_copy[sq_copy.size()/2];
-            double h = std::sqrt(median_sq) + 1e-12;
-
-            // similarity matrix
-            std::vector<double> S(N * N);
-
-            for (int i = 0; i < N; i++)
-            {
-                for (int j = 0; j < N; j++)
-                {
-                    S[i*N + j] = std::exp(-sq[i*N + j] / (2*h*h));
-                }
-            }
-
-            // similarity threshold
-            std::vector<double> S_copy = S;
-            std::nth_element(S_copy.begin(),
-                            S_copy.begin() + S_copy.size()/2,
-                            S_copy.end());
-
-            double median_S = S_copy[S_copy.size()/2];
-            double thresh = tau * median_S;
-
-            // adjacency list
-            std::vector<std::vector<int>> adj(N);
-
-            for (int i = 0; i < N; i++)
-            {
-                for (int j = i+1; j < N; j++)
-                {
-                    if (S[i*N + j] >= thresh)
-                    {
-                        adj[i].push_back(j);
-                        adj[j].push_back(i);
-                    }
-                }
-            }
-
-            // BFS for largest connected component
-            std::vector<bool> visited(N, false);
-            std::vector<int> best_comp;
-
-            for (int i = 0; i < N; i++)
-            {
-                if (!visited[i])
-                {
-                    std::vector<int> comp;
-                    std::deque<int> queue;
-
-                    queue.push_back(i);
-                    visited[i] = true;
-
-                    while (!queue.empty())
-                    {
-                        int u = queue.front();
-                        queue.pop_front();
-
-                        comp.push_back(u);
-
-                        for (int v : adj[u])
-                        {
-                            if (!visited[v])
-                            {
-                                visited[v] = true;
-                                queue.push_back(v);
-                            }
-                        }
-                    }
-
-                    if (comp.size() > best_comp.size())
-                        best_comp = comp;
-                }
-            }
-
-            std::vector<bool> mask(N, false);
-            for (int idx : best_comp)
-                mask[idx] = true;
 
             return mask;
         }
-
 
         //sometimes optimization converges prematurely, this function tries to detect possible optimums and refocus the search
         //returns, first which is whether refocus happened and second which is the best objective value
+        std::pair<bool, double> _try_refocus(const std::array<double,batch * dim>& X_flat,const std::array<double, batch>& fvals,double& refocus_threshold,int& refocus_min_samples)
+        {
+            // Count qualifying samples, compute their mean, and track best objective value.
+            std::size_t count = 0;
+            std::array<double, dim> mu0_new{};
+            mu0_new.fill(0.0);
 
-        std::pair<bool,double> _try_refocus(std::array<double,batch*dim> &X_flat,std::array<double,batch> &fvals,double refocus_threshold,int refocus_min_samples )
-        { 
-            int count = 0;
-            // gather indices of near-zero samples
-            std::vector<int> indices;
-            for (int i = 0; i < batch; i++) {
-                if (fvals[i] >= refocus_threshold) {
-                    indices.push_back(i);
+            double bestf = -std::numeric_limits<double>::infinity();
+            
+            for (std::size_t i = 0; i < batch; ++i) {
+                if (fvals[i] >= refocus_threshold) { // is the sample good enough
+                    ++count; //increase number o qualifing samples
+                    bestf = std::max(bestf, fvals[i]); //tracks best objective
+
+                    const std::size_t base = i * dim;
+                    for (std::size_t j = 0; j < dim; ++j) {
+                        mu0_new[j] += X_flat[base + j];
+                    }
                 }
             }
-            
-            count = indices.size();
 
+            if (count < static_cast<std::size_t>(refocus_min_samples)) {
+                return {false, 0.0};
+            }
 
-            if (count >= refocus_min_samples) {
-                //if count samples are more than or equal to refocus min samples, we  refocus, this prevents tiny clusters from messing arround
+            for (std::size_t j = 0; j < dim; ++j) {
+                mu0_new[j] /= static_cast<double>(count);
+            }
 
-                //builds X0 which is an array of promising samples, vectoor is used here because we do not know the size that will be required, we also initialize it to 0.0
-                std::vector<double> X0(count * dim, 0.0); //size is count * dim, so for each one, we have all the dimensions of the problem
-                for (int r = 0; r < count; ++r) {
-                    int row = indices[r];
-                    for (int j = 0; j < dim; ++j) X0[r*dim + j] = X_flat[row*dim + j]; //this one then copies thoose specific ones, using indices so that they are specifically the rows that are extracted and put in X0
-                }
+            // Covariance of the qualifying samples.
+            std::array<double, dim * dim> sigma0_new{};
+            sigma0_new.fill(0.0);
 
-                // computes a mean of promising samples, think of it as mu generation of the new samples -> shifts center to promising regions
-                std::array<double, dim> mu0_new{};
-                mu0_new.fill(0.0);
-                for (int r = 0; r < count; ++r)
-                    for (int j = 0; j < dim; ++j) mu0_new[j] += X0[r*dim + j];
-                for (int j = 0; j < dim; ++j) mu0_new[j] /= static_cast<double>(count);
+            if (count > 1) {
+                for (std::size_t i = 0; i < batch; ++i) {
+                    if (fvals[i] < refocus_threshold) {
+                        continue;
+                    }
 
-                // computes  covariance of the promising points, the spread of the new ones 
-                std::array<double, dim*dim> sigma0_new{};//initializes to 0
-
-                if (count > 1) {
-                    for (int r = 0; r < count; ++r) {
-                        for (int j = 0; j < dim; ++j) {
-                            double dj = X0[r*dim + j] - mu0_new[j];
-                            for (int t = 0; t < dim; ++t) {
-                                double dk = X0[r*dim + t] - mu0_new[t];
-                                sigma0_new[j*dim + t] += dj * dk;
-                            }
+                    const std::size_t base = i * dim;
+                    for (std::size_t j = 0; j < dim; ++j) {
+                        const double dj = X_flat[base + j] - mu0_new[j];
+                        for (std::size_t t = 0; t < dim; ++t) {
+                            const double dk = X_flat[base + t] - mu0_new[t];
+                            sigma0_new[j * dim + t] += dj * dk;
                         }
                     }
-                    double denom = static_cast<double>(count - 1);
-                    for (int k = 0; k < dim*dim; ++k) sigma0_new[k] /= denom;
-                } else {
-                    // degenerate: single sample -> tiny covariance
-                    for (int d = 0; d < dim; ++d) sigma0_new[d*dim + d] = 1e-8;
                 }
 
-                for (int d = 0; d < dim; ++d) sigma0_new[d*dim + d] += 1e-8;
-                // commit
-                mu0 = mu0_new; // this updates the mu0 and sigma0 with the new ones specifically
-                sigma0 = sigma0_new;
-
-                // computes the best objective in the refocused set and returns true with best f
-                double bestf = -std::numeric_limits<double>::infinity();
-                for (int idx : indices) if (fvals[idx] > bestf) bestf = fvals[idx];
-                refocus_thres+=refocus_change_rate; //new additions - creates an adaptive refocus
-                refocus_min_samples-=1; //reduces amount of samples required
-                return {true, bestf};
+                const double denom = static_cast<double>(count - 1);
+                for (double& x : sigma0_new) {
+                    x /= denom;
+                }
+            } else {
+                // Degenerate case: one sample only.
+                for (std::size_t d = 0; d < dim; ++d) {
+                    sigma0_new[d * dim + d] = 1e-8;
+                }
             }
 
-            return {false, 0.0}; //if not enough promising samples, returns this and what happens is the optimizer continues normally
+            // Diagonal regularization.
+            for (std::size_t d = 0; d < dim; ++d) {
+                sigma0_new[d * dim + d] += 1e-8;
+            }
+
+            // Commit the new refocus state.
+            mu0 = mu0_new;
+            sigma0 = sigma0_new;
+
+            // Adaptive update.
+            refocus_threshold += refocus_change_rate;
+            refocus_min_samples = std::max(1, refocus_min_samples - 1);
+
+            return {true, bestf};
         }
+
 
         std::pair<bool,double> step() {
 
@@ -364,7 +403,7 @@ class Optimizer{ //optimization class
             if (refocus_result.first){ return refocus_result;}
 
             // macro cluster - creates promising cluster samples
-            std::vector<bool> mask_macro = cluster_mask_macro(X_flat, tau_macro);
+            std::vector<uint8_t> mask_macro = cluster_mask_macro(X_flat, tau_macro);
             int macro_count = 0; //how many samples survived macro
             for (bool b : mask_macro) if (b) ++macro_count;
             //this is fallback which falls back to entire batch
@@ -388,7 +427,7 @@ class Optimizer{ //optimization class
             }
 
             // creates micro samples within the macro cluster
-            std::vector<bool> mask_micro = cluster_mask_micro(Xm, tau_micro);
+            std::vector<uint8_t> mask_micro = cluster_mask_micro(Xm, tau_micro);
             int micro_count = 0;
             for (bool b : mask_micro) if (b) ++micro_count;
 
@@ -501,7 +540,6 @@ class Optimizer{ //optimization class
                 std::cerr << "Warning: new_Sigma invalid; skipping update\n";
                 return {false, -std::numeric_limits<double>::infinity()};
             }
-
             // Commit update
             mu0 = new_mu;
             sigma0 = new_Sigma;
@@ -513,8 +551,6 @@ class Optimizer{ //optimization class
 
             return {false, best_f};
         }
-
-
 
         std::vector<HistoryEntry> optimize(int iters){
         std::vector<HistoryEntry> history;
@@ -528,9 +564,7 @@ class Optimizer{ //optimization class
                 history.push_back(std::move(h));
             }
             return history;
-
         };
-
 
 public:
     void run(
@@ -556,18 +590,14 @@ public:
         mu0 = mu0_generation();
         sigma0 = sigma_generation();
 
-        // seed RNG once here (deterministic when desired)
-        if (random_seed >= 0) rng.seed(static_cast<uint32_t>(random_seed));
-        else rng.seed(std::random_device{}());
-
         auto history = optimize(iterations);
         for (size_t i = 0; i < history.size(); ++i) {
-            const auto& h = history[i];
-            std::cout << "Iter " << i<< " best_f=" << h.best_f << " mu=(";
-            for (int d = 0; d < dim; ++d) {
-                std::cout << h.mu[d] << (d+1<dim? ", ":"");
-            }
-            std::cout << ") refocused=" << (h.refocused? "yes":"no") << "\n";
+                const auto& h = history[i];
+                std::cout << "Iter " << i<< " best_f=" << h.best_f << " mu=(";
+                for (int d = 0; d < dim; ++d) {
+                        std::cout << h.mu[d] << (d+1<dim? ", ":"");
+                }
+                std::cout << ") refocused=" << (h.refocused? "yes":"no") << "\n";
         }
         }
 
@@ -580,18 +610,13 @@ Optimizer<10,1000> session;
 
 //parameters
 double eta = 0.09;
-double tau_macro=0.3;
-double tau_micro=0.5;
+double tau_macro=0.5;
+double tau_micro=0.3;
 double refocus_thresh=-0.98;
-int refocus_min_samples=200;
+int refocus_min_samples=20;
 int random_seed=42;
-int iterations=2;
+int iterations=100;
 double refocus_change_rate=0.04;
-
-
-
-
-
 
 session.run(
         eta, // eta 
